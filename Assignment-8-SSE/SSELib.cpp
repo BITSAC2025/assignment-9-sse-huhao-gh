@@ -17,68 +17,68 @@ using namespace z3;
 /// This implementation, slightly different from Assignment-1, requires ICFGNode* as the first argument.
 void SSE::reachability(const ICFGEdge* curEdge, const ICFGNode* snk) {
     /// TODO: your code starts from here
+    const ICFGNode* curNode = curEdge->getDstNode();
 
-    const ICFGNode *curNode = curEdge->getDstNode();
-
-    // 起始：从 GlobalICFGNode 出发的“虚拟边”（src 为 nullptr）
+    // 起点：GlobalICFGNode，对应 analyse() 里构造的那条虚拟边（src == nullptr）
     if (curEdge->getSrcNode() == nullptr) {
-        // 对每个 sink（assert 调用点）单独做 DFS，因此先清空搜索状态
+        // 每次从入口搜到某个 sink 之前，先初始化状态
         visited.clear();
         callstack.clear();
         path.clear();
 
-        // 从 GlobalICFGNode 的所有出边开始 DFS
-        for (const ICFGEdge *outEdge : curNode->getOutEdges()) {
+        // 从入口节点的所有出边开始 DFS
+        for (const ICFGEdge* outEdge : curNode->getOutEdges()) {
             reachability(outEdge, snk);
         }
         return;
     }
 
-    // === 下面是真实的 ICFGEdge 的处理 ===
-
-    // 把当前边加入当前路径
+    // 把当前真实边加入路径
     path.push_back(curEdge);
 
-    // 用 <当前边, 当前调用栈> 作为 key 做上下文敏感去重
+    // 用 <当前边, 当前调用栈> 做“当前 DFS 路径上的去重”，防止在同一上下文里绕圈子
     ICFGEdgeStackPair state(curEdge, callstack);
-    if (!visited.insert(state).second) {
-        // 在同一调用上下文下，这条边已经访问过了（避免在同一个上下文中反复绕圈）
+    bool inserted = visited.insert(state).second;
+    if (!inserted) {
+        // 在当前路径中，这个 (edge, callstack) 已经出现过，说明遇到了环，剪掉
         path.pop_back();
         return;
     }
 
-    // 如果当前节点已经是 sink（某个 svf_assert 调用点），收集并翻译这条路径
+    // 如果到达 sink（断言调用点），收集并翻译整条路径
     if (curNode == snk) {
         collectAndTranslatePath();
+        // 回溯前必须把当前状态从 visited 中移除，否则会误剪掉别的合法路径
+        visited.erase(state);
         path.pop_back();
         return;
     }
 
-    // 否则继续从当前节点往后 DFS
-    for (const ICFGEdge *outEdge : curNode->getOutEdges()) {
-        if (const CallCFGEdge *callEdge = SVFUtil::dyn_cast<CallCFGEdge>(outEdge)) {
-            // 函数调用：先把调用点压栈，再递归遍历 call edge
+    // 继续从当前节点沿所有出边深度优先遍历
+    for (const ICFGEdge* outEdge : curNode->getOutEdges()) {
+        // 调用边：压入调用点，进入被调函数
+        if (const CallCFGEdge* callEdge = SVFUtil::dyn_cast<CallCFGEdge>(outEdge)) {
             callstack.push_back(callEdge->getSrcNode());
             reachability(outEdge, snk);
             callstack.pop_back();
-        } else if (const RetCFGEdge *retEdge = SVFUtil::dyn_cast<RetCFGEdge>(outEdge)) {
-            // 函数返回：弹出一层调用点，再递归遍历 ret edge，回来后恢复
-            if (!callstack.empty()) {
-                const ICFGNode *lastCall = callstack.back();
+        }
+        // 返回边：只在与当前栈顶 callsite 匹配时才允许返回，保证 call/ret 成对
+        else if (const RetCFGEdge* retEdge = SVFUtil::dyn_cast<RetCFGEdge>(outEdge)) {
+            if (!callstack.empty() && callstack.back() == retEdge->getCallSite()) {
+                const ICFGNode* lastCall = callstack.back();
                 callstack.pop_back();
                 reachability(outEdge, snk);
                 callstack.push_back(lastCall);
-            } else {
-                // 理论上不该出现（没有调用栈却有返回边），当普通边处理
-                reachability(outEdge, snk);
             }
-        } else {
-            // 普通 IntraCFGEdge
+        }
+        // 普通 CFG 内部边
+        else {
             reachability(outEdge, snk);
         }
     }
 
-    // 回溯当前边
+    // 当前节点所有后继都遍历完，回溯：把当前状态从 visited 中删除，再弹出路径上的这条边
+    visited.erase(state);
     path.pop_back();
 }
 
@@ -89,111 +89,114 @@ void SSE::reachability(const ICFGEdge* curEdge, const ICFGNode* snk) {
 /// you will need to call assertchecking to verify the assertion (which is the last ICFGNode of this path); (4) reset z3 solver.
 void SSE::collectAndTranslatePath() {
     /// TODO: your code starts from here
-
     if (path.empty())
         return;
 
-    // (1) 把当前路径转成字符串，加入 paths 集合（用于测试/调试）
+    // (1) 把当前路径转换成字符串加入 paths（仅用于记录/测试）
     std::string pathStr;
 
-    const ICFGEdge *firstEdge = path.front();
-    const ICFGNode *startNode = firstEdge->getSrcNode();
+    // 先记录第一个边的源节点（入口）
+    const ICFGEdge* firstEdge = path.front();
+    const ICFGNode* startNode = firstEdge->getSrcNode();
     if (startNode) {
         pathStr += std::to_string(startNode->getId());
     }
 
-    for (const ICFGEdge *edge : path) {
-        const ICFGNode *dst = edge->getDstNode();
+    // 依次追加每条边的目标节点
+    for (const ICFGEdge* edge : path) {
+        const ICFGNode* dst = edge->getDstNode();
         pathStr += "->";
         pathStr += std::to_string(dst->getId());
     }
+
     paths.insert(pathStr);
 
-    // (2) 在翻译整条路径前，先把 GlobalICFGNode 上的初始化语句翻译一遍
-    bool feasible = true;
-    if (startNode && SVFUtil::isa<GlobalICFGNode>(startNode)) {
-        // 伪造一条 IntraCFGEdge：src = nullptr, dst = GlobalICFGNode
-        const IntraCFGEdge fakeGlobalEdge(nullptr, const_cast<ICFGNode *>(startNode));
-        feasible = handleNonBranch(&fakeGlobalEdge);
-    }
+    // (2) 调用 translatePath，将该路径上的语句翻译为 Z3 约束
+    bool feasible = translatePath(path);
 
-    // 再翻译实际路径中的各个语句
-    if (feasible)
-        feasible = translatePath(path);
-
-    // (3) 可行路径：最后一个结点是断言调用点，做断言检查
+    // (3) 若路径可行，则最后一个节点应为断言调用点，对其进行断言检查
     if (feasible) {
-        const ICFGNode *lastNode = path.back()->getDstNode();
+        const ICFGNode* lastNode = path.back()->getDstNode();
         assertchecking(lastNode);
     }
 
-    // (4) 为下一条路径重置 solver 和调用上下文
+    // (4) 重置 z3 solver，为下一条路径分析做准备（包括清空 callingCtx）
     resetSolver();
 }
 
 /// TODO: Implement handling of function calls
-void SSE::handleCall(const CallCFGEdge* callEdge) {
+void SSE::handleCall(const CallCFGEdge* calledge) {
     /// TODO: your code starts from here
+    expr_vector actualArgs(getCtx());
+    auto& callPEs = calledge->getCallPEs();
+    for (auto callPE : callPEs) {
+        expr rhs = getZ3Expr(callPE->getRHSVarID());   // caller 上的实参
+        actualArgs.push_back(rhs);
+    }
 
-    // 进入被调函数：记录调用点作为 Z3 变量命名的调用上下文
-    pushCallingCtx(callEdge->getSrcNode());
+    // 进入被调函数：把“调用点 ICFGNode”压入 callingCtx（用于 Z3 变量加上下文后缀）
+    pushCallingCtx(calledge->getSrcNode());
 
-    // 用 CallPE 把 caller 的实参和 callee 的形参连起来
-    const auto &callPEs = callEdge->getCallPEs();
-    for (auto pe : callPEs) {
-        expr lhs = getZ3Expr(pe->getLHSVarID());  // callee 里的形式参数
-        expr rhs = getZ3Expr(pe->getRHSVarID());  // caller 里的实际参数
-        addToSolver(lhs == rhs);
+    // 把实际参数约束到形式参数（callee 侧 LHS）
+    u32_t idx = 0;
+    for (auto callPE : callPEs) {
+        expr lhs = getZ3Expr(callPE->getLHSVarID());   // callee 形参
+        addToSolver(lhs == actualArgs[idx++]);
     }
 }
 
 /// TODO: Implement handling of function returns
 void SSE::handleRet(const RetCFGEdge* retEdge) {
     /// TODO: your code starts from here
+    auto retPE = retEdge->getRetPE();
 
-    const RetPE *retPE = retEdge->getRetPE();
-
-    // 先在被调函数上下文下拿到返回值（如果有）
-    expr retVal(getCtx());
-    bool hasRetVal = false;
+    // callee 里的返回值（formal return）
+    expr rhs = getCtx().int_val(0);
     if (retPE) {
-        retVal = getZ3Expr(retPE->getRHSVarID()); // callee 的返回值
-        hasRetVal = true;
+        rhs = getZ3Expr(retPE->getRHSVarID());
     }
 
-    // 弹出调用上下文，切回 caller
+    // 离开被调函数：弹出调用上下文
     popCallingCtx();
 
-    // 在 caller 上下文中把返回值约束给接收返回值的变量
-    if (retPE && hasRetVal) {
-        expr lhs = getZ3Expr(retPE->getLHSVarID()); // caller 里的接收变量
-        addToSolver(lhs == retVal);
+    // 如果有返回值，把它约束到 caller 的接收变量上（actual return）
+    if (retPE) {
+        expr lhs = getZ3Expr(retPE->getLHSVarID());
+        addToSolver(lhs == rhs);
     }
 }
 
 /// TODO: Implement handling of branch statements inside a function
 /// Return true if the path is feasible, false otherwise.
+/// A given if/else branch on the ICFG looks like the following:
+///       	     ICFGNode1 (condition %cmp)
+///       	     1	/    \  0
+///       	  ICFGNode2   ICFGNode3
+/// edge->getCondition() returns the branch condition variable (%cmp) of type SVFValue* (for if/else) or a numeric condition variable (for switch).
+/// Given the condition variable, you could obtain the SVFVar ID via "edge->getCondition()->getId()"
+/// edge->getCondition() returns nullptr if this IntraCFGEdge is not a branch.
+/// edge->getSuccessorCondValue() returns the actual condition value (1/0 for if/else) when this branch/IntraCFGEdge is executed. For example, the successorCondValue is 1 on the edge from ICFGNode1 to ICFGNode2, and 0 on the edge from ICFGNode1 to ICFGNode3
 bool SSE::handleBranch(const IntraCFGEdge* edge) {
     /// TODO: your code starts from here
+    const SVFValue* condVal = edge->getCondition();
+    assert(condVal && "IntraCFGEdge with branch must have a condition!");
 
-    const SVFValue *condVal = edge->getCondition();
-    assert(condVal && "Branch IntraCFGEdge must have a condition!");
-
-    // cmp 的结果（一般是 0/1），以及该边对应的条件值（1/0, 或 switch 的某个 case 值）
     expr cond = getZ3Expr(condVal->getId());
+    // 当前这条分支真正被执行时，条件求值应等于 successorCondValue (0/1 或 switch 的具体值)
     expr succ = getCtx().int_val((s32_t)edge->getSuccessorCondValue());
 
-    // 先在一个 push 的 scope 里试探性加上 cond==succ，看当前路径下是否可行
+    // 先用 push/pop 做一次“试探”，看加上 cond == succ 约束后是否仍可满足
     getSolver().push();
     addToSolver(cond == succ);
     z3::check_result res = getSolver().check();
     getSolver().pop();
 
     if (res == z3::unsat) {
-        // 该分支在当前路径约束下不可达
+        // 该分支在当前路径下不可行
         return false;
-    } else {
-        // 分支可行，把约束真正加进 solver
+    }
+    else {
+        // 该分支可行，把约束真正加入 solver
         addToSolver(cond == succ);
         return true;
     }
@@ -210,51 +213,58 @@ bool SSE::handleNonBranch(const IntraCFGEdge* edge) {
     {
         if (const AddrStmt *addr = SVFUtil::dyn_cast<AddrStmt>(stmt))
         {
-            // lhs = &obj
+            // TODO: implement AddrStmt handler here
+            expr obj = getMemObjAddress(addr->getRHSVarID());
+            // lhs: 左边指针变量
             expr lhs = getZ3Expr(addr->getLHSVarID());
-            expr objAddr = getMemObjAddress(addr->getRHSVarID());
-            addToSolver(lhs == objAddr);
+            addToSolver(lhs == obj);
         }
         else if (const CopyStmt *copy = SVFUtil::dyn_cast<CopyStmt>(stmt))
         {
-            // 简单赋值：lhs = rhs
+            // TODO: implement CopyStmt handler her
             expr lhs = getZ3Expr(copy->getLHSVarID());
             expr rhs = getZ3Expr(copy->getRHSVarID());
             addToSolver(lhs == rhs);
         }
         else if (const LoadStmt *load = SVFUtil::dyn_cast<LoadStmt>(stmt))
         {
-            // lhs = *ptr
+            // TODO: implement LoadStmt handler here
             expr lhs = getZ3Expr(load->getLHSVarID());
-            expr ptr = getZ3Expr(load->getRHSVarID());
-            expr val = z3Mgr->loadValue(ptr);
-            addToSolver(lhs == val);
+            expr rhs = getZ3Expr(load->getRHSVarID());   // 地址
+            addToSolver(lhs == z3Mgr->loadValue(rhs));
         }
         else if (const StoreStmt *store = SVFUtil::dyn_cast<StoreStmt>(stmt))
         {
-            // *ptr = val
-            expr ptr = getZ3Expr(store->getLHSVarID());
-            expr val = getZ3Expr(store->getRHSVarID());
-            z3Mgr->storeValue(ptr, val);
+            // TODO: implement StoreStmt handler here
+            expr lhs = getZ3Expr(store->getLHSVarID());  // 地址
+            expr rhs = getZ3Expr(store->getRHSVarID());  // 要存的值
+            z3Mgr->storeValue(lhs, rhs);
         }
         else if (const GepStmt *gep = SVFUtil::dyn_cast<GepStmt>(stmt))
         {
-            // lhs = base + offset
-            expr lhs  = getZ3Expr(gep->getLHSVarID());
-            expr base = getZ3Expr(gep->getRHSVarID());
+            // TODO: implement GepStmt handler here
+            expr lhs = getZ3Expr(gep->getLHSVarID());
+            expr rhs = getZ3Expr(gep->getRHSVarID());   // base pointer
+            // 计算偏移（依据当前调用上下文）
             s32_t offset = z3Mgr->getGepOffset(gep, callingCtx);
-            expr gepAddr = z3Mgr->getGepObjAddress(base, (u32_t)offset);
-            addToSolver(lhs == gepAddr);
+            // 得到偏移字段的新地址
+            expr gepAddress = z3Mgr->getGepObjAddress(rhs, offset);
+            addToSolver(lhs == gepAddress);
         }
+            /// Given a CmpStmt "r = a > b"
+            /// cmp->getOpVarID(0)/cmp->getOpVarID(1) returns the first/second operand, i.e., "a" and "b"
+            /// cmp->getResID() returns the result operand "r" and cmp->getPredicate() gives you the predicate ">"
+            /// Find the comparison predicates in "class CmpStmt:Predicate" under SVF/svf/include/SVFIR/SVFStatements.h
+            /// You are only required to handle integer predicates, including ICMP_EQ, ICMP_NE, ICMP_UGT, ICMP_UGE, ICMP_ULT, ICMP_ULE, ICMP_SGT, ICMP_SGE, ICMP_SLE, ICMP_SLT
+            /// We assume integer-overflow-free in this assignment
         else if (const CmpStmt *cmp = SVFUtil::dyn_cast<CmpStmt>(stmt))
         {
-            // r = (a ? b)，结果 r 用 0/1 表示
+            // TODO: implement CmpStmt handler here
             expr op0 = getZ3Expr(cmp->getOpVarID(0));
             expr op1 = getZ3Expr(cmp->getOpVarID(1));
             expr res = getZ3Expr(cmp->getResID());
             expr one  = getCtx().int_val(1);
             expr zero = getCtx().int_val(0);
-
             switch (cmp->getPredicate())
             {
                 case CmpStmt::ICMP_EQ:
@@ -263,35 +273,22 @@ bool SSE::handleNonBranch(const IntraCFGEdge* edge) {
                 case CmpStmt::ICMP_NE:
                     addToSolver(res == ite(op0 != op1, one, zero));
                     break;
-
-                // 无符号比较：用 bitvector 的 ugt/uge/ult/ule
                 case CmpStmt::ICMP_UGT:
-                    addToSolver(res == ite(ugt(int2bv(32, op0), int2bv(32, op1)), one, zero));
-                    break;
-                case CmpStmt::ICMP_UGE:
-                    addToSolver(res == ite(uge(int2bv(32, op0), int2bv(32, op1)), one, zero));
-                    break;
-                case CmpStmt::ICMP_ULT:
-                    addToSolver(res == ite(ult(int2bv(32, op0), int2bv(32, op1)), one, zero));
-                    break;
-                case CmpStmt::ICMP_ULE:
-                    addToSolver(res == ite(ule(int2bv(32, op0), int2bv(32, op1)), one, zero));
-                    break;
-
-                // 有符号比较：用整数的 > >= < <=
                 case CmpStmt::ICMP_SGT:
                     addToSolver(res == ite(op0 > op1, one, zero));
                     break;
+                case CmpStmt::ICMP_UGE:
                 case CmpStmt::ICMP_SGE:
                     addToSolver(res == ite(op0 >= op1, one, zero));
                     break;
+                case CmpStmt::ICMP_ULT:
                 case CmpStmt::ICMP_SLT:
                     addToSolver(res == ite(op0 < op1, one, zero));
                     break;
+                case CmpStmt::ICMP_ULE:
                 case CmpStmt::ICMP_SLE:
                     addToSolver(res == ite(op0 <= op1, one, zero));
                     break;
-
                 default:
                     assert(false && "unhandled integer comparison predicate");
             }
