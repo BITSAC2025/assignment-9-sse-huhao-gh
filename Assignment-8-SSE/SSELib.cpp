@@ -19,11 +19,11 @@ void SSE::reachability(const ICFGEdge* curEdge, const ICFGNode* snk) {
     /// TODO: your code starts from here
     const ICFGNode* curNode = curEdge->getDstNode();
 
-    /// 第一次从 entry 进来：curEdge 的 src 为 nullptr，这里作为 DFS 的起点，
-    /// 不把这条虚拟边加入 path，只从它的 dst（程序入口）往外扩展。
+    // 第一次从 entry 进来：curEdge 的 src 为 nullptr，这里作为 DFS 的起点，
+    // 不把这条虚拟边加入 path，只从它的 dst（程序入口）往外扩展。
     if (curEdge->getSrcNode() == nullptr) {
         // 为这一次从 entry 到某个 sink 的搜索做初始化
-        visited.clear();
+        visited.clear();     // 虽然下面不再用 visited，但清一下也没坏处
         callstack.clear();
         path.clear();
 
@@ -37,14 +37,6 @@ void SSE::reachability(const ICFGEdge* curEdge, const ICFGNode* snk) {
     // 将当前真实边加入当前路径
     path.push_back(curEdge);
 
-    // 利用 <当前边, 当前调用栈> 做上下文敏感去重，避免在同一调用上下文中重复遍历环路
-    ICFGEdgeStackPair state(curEdge, callstack);
-    if (!visited.insert(state).second) {
-        // 之前已经以同样的调用栈访问过这条边，直接回溯
-        path.pop_back();
-        return;
-    }
-
     // 如果已经到达 sink（断言节点），收集并翻译这条路径
     if (curNode == snk) {
         collectAndTranslatePath();
@@ -54,14 +46,30 @@ void SSE::reachability(const ICFGEdge* curEdge, const ICFGNode* snk) {
 
     // 继续从当前节点向后遍历所有出边
     for (const ICFGEdge* outEdge : curNode->getOutEdges()) {
-        // 对于调用边，在递归前入栈调用点，在返回后出栈，维持上下文敏感的调用栈
+
+        // === 关键修复点：只在“当前路径”上做环检测，防止无限循环，但不会屏蔽另一条分支的路径 ===
+        bool alreadyInPath = false;
+        for (const ICFGEdge* eInPath : path) {
+            if (eInPath == outEdge) {
+                alreadyInPath = true;
+                break;
+            }
+        }
+        if (alreadyInPath) {
+            // 这条边已经在当前路径出现过，说明是 loop 回边的再次使用——为了“once for any loop”，这里不再走它
+            continue;
+        }
+        // === 环检测结束 ===
+
+        // 对于调用边，在递归前入栈调用点，在返回后出栈，维持上下文敏感的调用栈信息（仅用于 reachability）
         if (const CallCFGEdge* callEdge = SVFUtil::dyn_cast<CallCFGEdge>(outEdge)) {
+            // 这里压的是调用点 ICFGNode（callsite）
             callstack.push_back(callEdge->getSrcNode());
             reachability(outEdge, snk);
             callstack.pop_back();
         }
         // 对于返回边，在递归前弹出一层调用栈，递归结束后再恢复
-        else if (SVFUtil::isa<RetCFGEdge>(outEdge)) {
+        else if (const RetCFGEdge* retEdge = SVFUtil::dyn_cast<RetCFGEdge>(outEdge)) {
             const ICFGNode* lastCall = nullptr;
             if (!callstack.empty()) {
                 lastCall = callstack.back();
@@ -122,7 +130,7 @@ void SSE::collectAndTranslatePath() {
         assertchecking(lastNode);
     }
 
-    // (4) 重置 z3 solver，为下一条路径分析做准备
+    // (4) 重置 z3 solver，为下一条路径分析做准备（包括清空 callingCtx）
     resetSolver();
 }
 
@@ -132,17 +140,17 @@ void SSE::handleCall(const CallCFGEdge* calledge) {
     expr_vector actualArgs(getCtx());
     auto& callPEs = calledge->getCallPEs();
     for (auto callPE : callPEs) {
-        expr rhs = getZ3Expr(callPE->getRHSVarID());
+        expr rhs = getZ3Expr(callPE->getRHSVarID());   // caller 上的实参
         actualArgs.push_back(rhs);
     }
 
-    // 进入被调函数：把调用点 ICFGNode 压入 callingCtx
+    // 进入被调函数：把“调用点 ICFGNode”压入 callingCtx（用于 Z3 变量加上下文后缀）
     pushCallingCtx(calledge->getSrcNode());
 
     // 把实际参数约束到形式参数（callee 侧 LHS）
     u32_t idx = 0;
     for (auto callPE : callPEs) {
-        expr lhs = getZ3Expr(callPE->getLHSVarID());
+        expr lhs = getZ3Expr(callPE->getLHSVarID());   // callee 形参
         addToSolver(lhs == actualArgs[idx++]);
     }
 }
@@ -152,7 +160,7 @@ void SSE::handleRet(const RetCFGEdge* retEdge) {
     /// TODO: your code starts from here
     auto retPE = retEdge->getRetPE();
 
-    // formal return value（callee 里的返回值）
+    // callee 里的返回值（formal return）
     expr rhs = getCtx().int_val(0);
     if (retPE) {
         rhs = getZ3Expr(retPE->getRHSVarID());
@@ -161,7 +169,7 @@ void SSE::handleRet(const RetCFGEdge* retEdge) {
     // 离开被调函数：弹出调用上下文
     popCallingCtx();
 
-    // 如果有返回值，把它约束到 caller 的接收变量上
+    // 如果有返回值，把它约束到 caller 的接收变量上（actual return）
     if (retPE) {
         expr lhs = getZ3Expr(retPE->getLHSVarID());
         addToSolver(lhs == rhs);
@@ -184,7 +192,7 @@ bool SSE::handleBranch(const IntraCFGEdge* edge) {
     assert(condVal && "IntraCFGEdge with branch must have a condition!");
 
     expr cond = getZ3Expr(condVal->getId());
-    // 当前这条分支真正被执行时，条件求值应等于 successorCondValue (0/1)
+    // 当前这条分支真正被执行时，条件求值应等于 successorCondValue (0/1 或 switch 的具体值)
     expr succ = getCtx().int_val((s32_t)edge->getSuccessorCondValue());
 
     // 先用 push/pop 做一次“试探”，看加上 cond == succ 约束后是否仍可满足
