@@ -19,11 +19,10 @@ void SSE::reachability(const ICFGEdge* curEdge, const ICFGNode* snk) {
     /// TODO: your code starts from here
     const ICFGNode* curNode = curEdge->getDstNode();
 
-    // 第一次从 entry 进来：curEdge 的 src 为 nullptr，这里作为 DFS 的起点，
-    // 不把这条虚拟边加入 path，只从它的 dst（程序入口）往外扩展。
+    // 起点：GlobalICFGNode，对应 analyse() 里构造的那条虚拟边（src == nullptr）
     if (curEdge->getSrcNode() == nullptr) {
-        // 为这一次从 entry 到某个 sink 的搜索做初始化
-        visited.clear();     // 虽然下面不再用 visited，但清一下也没坏处
+        // 每次从入口搜到某个 sink 之前，先初始化状态
+        visited.clear();
         callstack.clear();
         path.clear();
 
@@ -34,61 +33,52 @@ void SSE::reachability(const ICFGEdge* curEdge, const ICFGNode* snk) {
         return;
     }
 
-    // 将当前真实边加入当前路径
+    // 把当前真实边加入路径
     path.push_back(curEdge);
 
-    // 如果已经到达 sink（断言节点），收集并翻译这条路径
-    if (curNode == snk) {
-        collectAndTranslatePath();
+    // 用 <当前边, 当前调用栈> 做“当前 DFS 路径上的去重”，防止在同一上下文里绕圈子
+    ICFGEdgeStackPair state(curEdge, callstack);
+    bool inserted = visited.insert(state).second;
+    if (!inserted) {
+        // 在当前路径中，这个 (edge, callstack) 已经出现过，说明遇到了环，剪掉
         path.pop_back();
         return;
     }
 
-    // 继续从当前节点向后遍历所有出边
+    // 如果到达 sink（断言调用点），收集并翻译整条路径
+    if (curNode == snk) {
+        collectAndTranslatePath();
+        // 回溯前必须把当前状态从 visited 中移除，否则会误剪掉别的合法路径
+        visited.erase(state);
+        path.pop_back();
+        return;
+    }
+
+    // 继续从当前节点沿所有出边深度优先遍历
     for (const ICFGEdge* outEdge : curNode->getOutEdges()) {
-
-        // === 关键修复点：只在“当前路径”上做环检测，防止无限循环，但不会屏蔽另一条分支的路径 ===
-        bool alreadyInPath = false;
-        for (const ICFGEdge* eInPath : path) {
-            if (eInPath == outEdge) {
-                alreadyInPath = true;
-                break;
-            }
-        }
-        if (alreadyInPath) {
-            // 这条边已经在当前路径出现过，说明是 loop 回边的再次使用——为了“once for any loop”，这里不再走它
-            continue;
-        }
-        // === 环检测结束 ===
-
-        // 对于调用边，在递归前入栈调用点，在返回后出栈，维持上下文敏感的调用栈信息（仅用于 reachability）
+        // 调用边：压入调用点，进入被调函数
         if (const CallCFGEdge* callEdge = SVFUtil::dyn_cast<CallCFGEdge>(outEdge)) {
-            // 这里压的是调用点 ICFGNode（callsite）
             callstack.push_back(callEdge->getSrcNode());
             reachability(outEdge, snk);
             callstack.pop_back();
         }
-        // 对于返回边，在递归前弹出一层调用栈，递归结束后再恢复
+        // 返回边：只在与当前栈顶 callsite 匹配时才允许返回，保证 call/ret 成对
         else if (const RetCFGEdge* retEdge = SVFUtil::dyn_cast<RetCFGEdge>(outEdge)) {
-            const ICFGNode* lastCall = nullptr;
-            if (!callstack.empty()) {
-                lastCall = callstack.back();
+            if (!callstack.empty() && callstack.back() == retEdge->getCallSite()) {
+                const ICFGNode* lastCall = callstack.back();
                 callstack.pop_back();
                 reachability(outEdge, snk);
                 callstack.push_back(lastCall);
             }
-            else {
-                // 异常情况：没有调用栈仍然有返回边，直接当普通边处理
-                reachability(outEdge, snk);
-            }
         }
+        // 普通 CFG 内部边
         else {
-            // 普通 Intra 边
             reachability(outEdge, snk);
         }
     }
 
-    // 回溯，弹出当前边
+    // 当前节点所有后继都遍历完，回溯：把当前状态从 visited 中删除，再弹出路径上的这条边
+    visited.erase(state);
     path.pop_back();
 }
 
